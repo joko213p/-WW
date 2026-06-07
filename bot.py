@@ -26,17 +26,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.environ["BOT_TOKEN"]
-IG_USER    = os.environ.get("IG_USER", "")
-IG_PASS    = os.environ.get("IG_PASS", "")
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+IG_USER     = os.environ.get("IG_USER", "")
+IG_PASS     = os.environ.get("IG_PASS", "")
+_raw_group  = os.environ.get("GROUP_ID", "")
+GROUP_ID    = int(_raw_group) if _raw_group else None
 
 DOWNLOAD_DIR   = Path("/tmp/ig_downloads")
-MAX_FILE_BYTES = 50 * 1024 * 1024   # 50 Mo — limite Telegram
+MAX_FILE_BYTES = 50 * 1024 * 1024
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def esc(text: str) -> str:
+    """Echappe les caracteres speciaux HTML."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def extract_username(text: str) -> Optional[str]:
-    """Extrait un username Instagram depuis une URL ou un @handle."""
     text = text.strip()
     for pattern in (
         r"instagram\.com/([A-Za-z0-9._]+)/?",
@@ -58,7 +64,7 @@ def human_size(n: int) -> str:
     return "{:.1f} Go".format(n)
 
 
-# ── Instaloader (sync, appelé via run_in_executor) ────────────────────────────
+# ── Instaloader ───────────────────────────────────────────────────────────────
 def _build_loader() -> instaloader.Instaloader:
     L = instaloader.Instaloader(
         dirname_pattern=str(DOWNLOAD_DIR / "{target}"),
@@ -81,10 +87,6 @@ def _build_loader() -> instaloader.Instaloader:
 
 
 def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path], List[str]]:
-    """
-    Toutes les operations instaloader sont synchrones et bloquantes.
-    Appelee dans un thread separe via run_in_executor.
-    """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     profile_dir = DOWNLOAD_DIR / username
     if profile_dir.exists():
@@ -94,7 +96,6 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
     L = _build_loader()
     skipped: List[str] = []
 
-    # Charger le profil
     try:
         profile = instaloader.Profile.from_username(L.context, username)
     except instaloader.exceptions.ProfileNotExistsException:
@@ -102,7 +103,6 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
     except Exception as exc:
         raise ValueError("Impossible d'acceder au profil : {}".format(exc))
 
-    # Posts & Reels
     if "posts" in content_types or "reels" in content_types:
         try:
             for post in profile.get_posts():
@@ -113,7 +113,6 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
         except Exception as exc:
             skipped.append("Lecture des posts impossible : {}".format(exc))
 
-    # Stories (necessite login)
     if "stories" in content_types:
         if not (IG_USER and IG_PASS):
             skipped.append("Stories : identifiants IG_USER / IG_PASS requis.")
@@ -128,7 +127,6 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
             except Exception as exc:
                 skipped.append("Stories : {}".format(exc))
 
-    # Stories a la une / Highlights (necessite login)
     if "highlights" in content_types:
         if not (IG_USER and IG_PASS):
             skipped.append("Stories a la une : identifiants IG_USER / IG_PASS requis.")
@@ -142,7 +140,6 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
             except Exception as exc:
                 skipped.append("Highlights : {}".format(exc))
 
-    # Collecter les fichiers telecharges
     files: List[Path] = []
     if profile_dir.exists():
         for ext in ("*.mp4", "*.jpg", "*.jpeg", "*.png", "*.webp"):
@@ -159,10 +156,6 @@ def _sync_download(username: str, content_types: List[str]) -> Tuple[List[Path],
 
 # ── Topic supergroupe ─────────────────────────────────────────────────────────
 async def get_or_create_topic(bot, chat_id: int, username: str) -> Optional[int]:
-    """
-    Cree un topic nomme @username dans un supergroupe avec topics actives.
-    Retourne le message_thread_id, ou None si non supporte.
-    """
     try:
         forum_topic = await bot.create_forum_topic(
             chat_id=chat_id,
@@ -177,13 +170,11 @@ async def get_or_create_topic(bot, chat_id: int, username: str) -> Optional[int]
         return None
 
 
-# ── Envoi d'un fichier ────────────────────────────────────────────────────────
+# ── Envoi fichier ─────────────────────────────────────────────────────────────
 async def send_file(bot, chat_id: int, thread_id: Optional[int], f: Path, caption: str):
-    """Envoie une photo ou video vers Telegram, avec ou sans topic."""
     kwargs = dict(chat_id=chat_id, caption=caption)
     if thread_id is not None:
         kwargs["message_thread_id"] = thread_id
-
     with open(f, "rb") as fh:
         if f.suffix.lower() == ".mp4":
             await bot.send_video(video=fh, **kwargs)
@@ -191,35 +182,35 @@ async def send_file(bot, chat_id: int, thread_id: Optional[int], f: Path, captio
             await bot.send_photo(photo=fh, **kwargs)
 
 
-# ── Handlers Telegram ─────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Bienvenue sur Instagram Downloader Bot !*\n\n"
-        "Envoie-moi un lien de profil Instagram ou un *@username* "
+        "👋 <b>Bienvenue sur Instagram Downloader Bot !</b>\n\n"
+        "Envoie-moi un lien de profil Instagram ou un <b>@username</b> "
         "et je telechargerai les medias de ton choix.\n\n"
         "Exemples :\n"
-        "• `https://www.instagram.com/natgeo`\n"
-        "• `@natgeo`\n\n"
-        "💡 *Supergroupe avec Topics* : chaque profil sera automatiquement "
+        "• <code>https://www.instagram.com/natgeo</code>\n"
+        "• <code>@natgeo</code>\n\n"
+        "💡 <b>Supergroupe avec Topics</b> : chaque profil sera automatiquement "
         "classe dans son propre fil.",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_creds = bool(IG_USER and IG_PASS)
-    creds_status = "OK configures" if has_creds else "non configures (IG\\_USER / IG\\_PASS manquants)"
+    creds_status = "✅ configures" if has_creds else "❌ non configures (IG_USER / IG_PASS manquants)"
     await update.message.reply_text(
-        "📖 *Aide*\n\n"
-        "*Comment utiliser :*\n"
+        "📖 <b>Aide</b>\n\n"
+        "<b>Comment utiliser :</b>\n"
         "1. Envoie un lien Instagram ou un @username\n"
         "2. Choisis le type de contenu\n"
         "3. Recois les fichiers (max 50 Mo/fichier)\n\n"
-        "*Types disponibles :*\n"
+        "<b>Types disponibles :</b>\n"
         "📸 Posts  |  🎬 Reels  |  📖 Stories  |  ⭐ A la une\n\n"
-        "*Identifiants Instagram :* {}\n"
-        "_(Stories & A la une necessitent un compte Instagram connecte)_".format(creds_status),
-        parse_mode=ParseMode.MARKDOWN,
+        "<b>Identifiants Instagram :</b> {}\n"
+        "<i>Stories &amp; A la une necessitent un compte Instagram connecte</i>".format(creds_status),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -230,8 +221,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username:
         await update.message.reply_text(
             "❌ Profil Instagram non reconnu.\n"
-            "Envoie un lien `https://www.instagram.com/username` ou `@username`.",
-            parse_mode=ParseMode.MARKDOWN,
+            "Envoie un lien <code>https://www.instagram.com/username</code> ou <code>@username</code>.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -241,7 +232,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = (
         ""
         if has_creds
-        else "\n\n⚠️ _Stories & A la une : IG\\_USER / IG\\_PASS non configures._"
+        else "\n\n⚠️ <i>Stories &amp; A la une : IG_USER / IG_PASS non configures.</i>"
     )
 
     keyboard = [
@@ -257,8 +248,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        "📲 Profil detecte : *@{}*\n\nQue veux-tu telecharger ?{}".format(username, note),
-        parse_mode=ParseMode.MARKDOWN,
+        "📲 Profil detecte : <b>@{}</b>\n\nQue veux-tu telecharger ?{}".format(esc(username), note),
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -280,12 +271,12 @@ async def handle_type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "type_all":        ["posts", "reels", "stories", "highlights"],
     }
     content_types = type_map.get(query.data, ["posts"])
-    chat_id = update.effective_chat.id
+    chat_id = GROUP_ID if GROUP_ID else update.effective_chat.id
     bot = context.bot
 
     await query.edit_message_text(
-        "⏳ Telechargement de *@{}* en cours…".format(username),
-        parse_mode=ParseMode.MARKDOWN,
+        "⏳ Telechargement de <b>@{}</b> en cours…".format(esc(username)),
+        parse_mode=ParseMode.HTML,
     )
 
     loop = asyncio.get_event_loop()
@@ -295,30 +286,30 @@ async def handle_type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             partial(_sync_download, username, content_types),
         )
     except ValueError as exc:
-        await query.edit_message_text("❌ {}".format(exc))
+        await query.edit_message_text("❌ {}".format(esc(str(exc))), parse_mode=ParseMode.HTML)
         return
     except Exception as exc:
         logger.exception("Erreur de telechargement inattendue")
-        await query.edit_message_text("❌ Erreur inattendue : {}".format(exc))
+        await query.edit_message_text("❌ Erreur inattendue : {}".format(esc(str(exc))), parse_mode=ParseMode.HTML)
         return
 
     if not files:
         reasons = (
-            "\n".join("• {}".format(s) for s in skipped)
+            "\n".join("• {}".format(esc(s)) for s in skipped)
             if skipped
             else "Aucun media trouve."
         )
         await query.edit_message_text(
-            "😕 Aucun fichier pour *@{}*.\n\n{}".format(username, reasons),
-            parse_mode=ParseMode.MARKDOWN,
+            "😕 Aucun fichier pour <b>@{}</b>.\n\n{}".format(esc(username), reasons),
+            parse_mode=ParseMode.HTML,
         )
         return
 
     thread_id = await get_or_create_topic(bot, chat_id, username)
 
     await query.edit_message_text(
-        "📤 Envoi de *{}* fichier(s) pour *@{}*…".format(len(files), username),
-        parse_mode=ParseMode.MARKDOWN,
+        "📤 Envoi de <b>{}</b> fichier(s) pour <b>@{}</b>…".format(len(files), esc(username)),
+        parse_mode=ParseMode.HTML,
     )
 
     sent = 0
@@ -330,12 +321,12 @@ async def handle_type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except TelegramError as exc:
             skipped.append("{} : {}".format(f.name, exc))
 
-    summary = "✅ *{}/{}* fichier(s) envoye(s) pour *@{}*.".format(sent, len(files), username)
+    summary = "✅ <b>{}/{}</b> fichier(s) envoye(s) pour <b>@{}</b>.".format(sent, len(files), esc(username))
     if skipped:
-        items = "\n".join("• {}".format(s) for s in skipped[:10])
-        summary += "\n\n⚠️ *Ignores :*\n{}".format(items)
+        items = "\n".join("• {}".format(esc(s)) for s in skipped[:10])
+        summary += "\n\n⚠️ <b>Ignores :</b>\n{}".format(items)
 
-    await query.edit_message_text(summary, parse_mode=ParseMode.MARKDOWN)
+    await query.edit_message_text(summary, parse_mode=ParseMode.HTML)
 
     profile_dir = DOWNLOAD_DIR / username
     if profile_dir.exists():
@@ -345,12 +336,10 @@ async def handle_type_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CallbackQueryHandler(handle_type_choice, pattern=r"^type_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
     logger.info("Bot Instagram Downloader demarre.")
     app.run_polling(drop_pending_updates=True)
 
